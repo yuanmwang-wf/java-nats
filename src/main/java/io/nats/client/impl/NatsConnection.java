@@ -26,17 +26,7 @@ import java.util.Iterator;
 import java.util.Map;
 import java.util.Timer;
 import java.util.TimerTask;
-import java.util.concurrent.CancellationException;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedDeque;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -83,7 +73,7 @@ class NatsConnection implements Connection {
     private boolean disconnecting; // you can only disconnect in one thread
     private boolean closing; // respect a close call regardless
     private Exception exceptionDuringConnectChange; // an exception occurred in another thread while disconnecting or
-                                                    // connecting
+    // connecting
 
     private Status status;
     private ReentrantLock statusLock;
@@ -101,7 +91,7 @@ class NatsConnection implements Connection {
 
     private Map<String, NatsSubscription> subscribers;
     private Map<String, NatsDispatcher> dispatchers; // use a concurrent map so we get more consistent iteration
-                                                     // behavior
+    // behavior
     private Map<String, CompletableFuture<Message>> responses;
     private ConcurrentLinkedDeque<CompletableFuture<Boolean>> pongQueue;
 
@@ -117,8 +107,8 @@ class NatsConnection implements Connection {
     private AtomicBoolean blockPublishForDrain;
 
     private ExecutorService callbackRunner;
-
     private ExecutorService executor;
+    private ExecutorService connectExecutor;
 
     NatsConnection(Options options) {
         this.options = options;
@@ -151,6 +141,7 @@ class NatsConnection implements Connection {
         this.writer = new NatsConnectionWriter(this);
 
         this.callbackRunner = Executors.newSingleThreadExecutor();
+        this.connectExecutor = Executors.newSingleThreadExecutor();
 
         this.executor = options.getExecutor();
     }
@@ -263,7 +254,7 @@ class NatsConnection implements Connection {
         } catch (Exception exp) {
             this.processException(exp);
         }
-        
+
         // When the flush returns we are done sending internal messages, so we can switch to the
         // non-reconnect queue
         this.writer.setReconnectMode(false);
@@ -308,9 +299,21 @@ class NatsConnection implements Connection {
 
             // Wait for the INFO message manually
             // all other traffic will use the reader and writer
-            readInitialInfo();
-            checkVersionRequirements();
-            upgradeToSecureIfNeeded();
+            Callable<Object> task = new Callable<Object>() {
+                public Object call() throws IOException {
+                    readInitialInfo();
+                    checkVersionRequirements();
+                    upgradeToSecureIfNeeded();
+                    return null;
+                }
+            };
+
+            Future<Object> future = this.connectExecutor.submit(task);
+            try {
+                future.get(this.options.getConnectionTimeout().toNanos(), TimeUnit.NANOSECONDS);
+            } finally {
+                future.cancel(true); // may or may not desire this
+            }
 
             // start the reader and writer after we secured the connection, if necessary
             this.reader.start(this.dataPortFuture);
@@ -460,13 +463,15 @@ class NatsConnection implements Connection {
         try {
             updateStatus(Status.DISCONNECTED);
             this.disconnecting = false;
+            // Ignore exceptions thrown during closeSocketImpl
+            this.exceptionDuringConnectChange = null;
             statusChanged.signalAll();
         } finally {
             statusLock.unlock();
         }
 
         if (isClosing()) { // Bit of a misname, but closing means we are in the close method or were asked
-                           // to be
+            // to be
             close();
         } else if (wasConnected && tryReconnectIfConnected) {
             reconnect();
@@ -590,6 +595,7 @@ class NatsConnection implements Connection {
         } catch (Exception ex) {
             processException(ex);
         }
+
     }
 
     void cleanUpPongQueue() {
@@ -984,14 +990,14 @@ class NatsConnection implements Connection {
             String connectOptions = this.options.buildProtocolConnectOptionsString(serverURI, info.isAuthRequired(), info.getNonce());
             connectString.append(connectOptions);
             NatsMessage msg = new NatsMessage(connectString.toString());
-            
+
             queueInternalOutgoing(msg);
         } catch (Exception exp) {
             exp.printStackTrace();
             throw new IOException("Error sending connect string", exp);
         }
     }
-    
+
     CompletableFuture<Boolean> sendPing() {
         return this.sendPing(true);
     }
@@ -999,7 +1005,7 @@ class NatsConnection implements Connection {
     CompletableFuture<Boolean> softPing() {
         return this.sendPing(false);
     }
-    
+
     // Send a ping request and push a pong future on the queue.
     // futures are completed in order, keep this one if a thread wants to wait
     // for a specific pong. Note, if no pong returns the wait will not return
@@ -1513,7 +1519,7 @@ class NatsConnection implements Connection {
         } finally {
             this.statusLock.unlock();
         }
-        
+
         final CompletableFuture<Boolean> tracker = this.draining.get();
         Instant start = Instant.now();
 
@@ -1541,7 +1547,7 @@ class NatsConnection implements Connection {
         });
 
         this.flush(timeout); // Flush and wait up to the timeout, if this fails, let the caller know
-        
+
         consumers.forEach((cons) -> {
             cons.markUnsubedForDrain();
         });
@@ -1559,7 +1565,7 @@ class NatsConnection implements Connection {
                             i.remove();
                         }
                     }
-                    
+
                     if (consumers.size() == 0) {
                         break;
                     }
